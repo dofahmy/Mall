@@ -27,8 +27,12 @@ CREATE TABLE IF NOT EXISTS tiles(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id T
 CREATE TABLE IF NOT EXISTS shops(user_id TEXT NOT NULL, category TEXT NOT NULL, PRIMARY KEY(user_id,category));
 CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, category TEXT NOT NULL, tier INTEGER NOT NULL DEFAULT 4, status TEXT NOT NULL DEFAULT 'owned');
 CREATE TABLE IF NOT EXISTS listings(id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id TEXT NOT NULL, asset_id INTEGER NOT NULL UNIQUE, price INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active', buyer_id TEXT, created_at INTEGER NOT NULL, sold_at INTEGER);
+CREATE TABLE IF NOT EXISTS rush_rounds(user_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, deadline INTEGER NOT NULL, stage INTEGER NOT NULL, served INTEGER NOT NULL DEFAULT 0, misses INTEGER NOT NULL DEFAULT 0, orders TEXT NOT NULL, reward_claimed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, info TEXT NOT NULL, created_at INTEGER NOT NULL);
 ''');c.close()
+
+def stage_reward(stage,seconds_left,misses):
+    return 35 + stage*12 + min(35,seconds_left) - min(30,misses*5)
 
 def add_ledger(c,u,kind,amount,info):
     c.execute('INSERT INTO ledger(user_id,kind,amount,info,created_at) VALUES(?,?,?,?,?)',(u,kind,amount,info,int(time.time())))
@@ -75,7 +79,13 @@ def snapshot(c,u):
     listings=[dict(r) for r in c.execute('SELECT l.id,l.asset_id,l.price,l.seller_id,p.name seller_name,a.category,a.tier FROM listings l JOIN assets a ON a.id=l.asset_id JOIN players p ON p.id=l.seller_id WHERE l.status="active" ORDER BY l.created_at DESC,l.id DESC LIMIT 100')]
     mylist=[x for x in listings if x['seller_id']==u]
     transactions=[dict(r) for r in c.execute('SELECT kind,amount,info,created_at FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 8',(u,))]
-    return dict(player=p,unlocked=unlocked,tiles=tiles,assets=assets,listings=listings,mylist=mylist,ledger=transactions, categories=CATS, icons=ICONS,demomode=DEMO_MODE,real_money_enabled=False)
+    rr=c.execute('SELECT * FROM rush_rounds WHERE user_id=?',(u,)).fetchone()
+    rush=None
+    if rr:
+        rush={'stage':rr['stage'],'served':rr['served'],'misses':rr['misses'],'deadline':rr['deadline'],'finished':bool(rr['reward_claimed']),'total':len(json.loads(rr['orders']))}
+        if rr['served']<rush['total'] and not rr['reward_claimed'] and time.time()<rr['deadline']:
+            rush['order']=json.loads(rr['orders'])[rr['served']]
+    return dict(rush=rush,player=p,unlocked=unlocked,tiles=tiles,assets=assets,listings=listings,mylist=mylist,ledger=transactions, categories=CATS, icons=ICONS,demomode=DEMO_MODE,real_money_enabled=False)
 
 @app.route('/')
 def home(): return send_from_directory('static','index.html')
@@ -93,15 +103,59 @@ def action():
     u,n=auth_user();d=request.get_json(silent=True) or {};cmd=d.get('action');c=conn()
     try:
         c.execute('BEGIN IMMEDIATE');p=player(c,u,n)
-        if cmd=='generate':
-            if p['energy']<1:raise ValueError('الطاقة خلصت — اجمع طاقة مجانية')
+        if cmd=='rush_start':
+            prev=c.execute('SELECT * FROM rush_rounds WHERE user_id=?',(u,)).fetchone()
+            if prev and prev['served']<len(json.loads(prev['orders'])) and time.time()<prev['deadline'] and not prev['reward_claimed']:
+                raise ValueError('فيه جولة شغالة بالفعل!')
+            # Every round is free; purchases and energy never affect scoring.
+            stage=max(1,min(12,int(d.get('stage',1)))) if isinstance(d.get('stage',1),int) else 1
+            if stage>min(12,1+p['level']//3):raise ValueError('المرحلة دي لسه مقفولة')
+            import random
+            items=['👗','👜','💄','🧴','🎧','📱','🪑','🧸']
+            rng=random.SystemRandom()
+            count=5+min(7,stage)
+            # An order is the exact icon to tap among 8 visible products.
+            orders=[rng.choice(items[:min(8,4+(stage//2))]) for _ in range(count)]
+            now=int(time.time())
+            duration=max(35,80-stage*3)
+            c.execute('INSERT OR REPLACE INTO rush_rounds(user_id,started_at,deadline,stage,served,misses,orders,reward_claimed) VALUES(?,?,?,?,0,0,?,0)',(u,now,now+duration,stage,json.dumps(orders,ensure_ascii=False)))
+        elif cmd=='rush_serve':
+            rr=c.execute('SELECT * FROM rush_rounds WHERE user_id=?',(u,)).fetchone()
+            if not rr or rr['reward_claimed']:raise ValueError('ابدئي جولة جديدة')
+            orders=json.loads(rr['orders'])
+            if rr['served']>=len(orders):raise ValueError('الجولة خلصت')
+            if time.time()>rr['deadline']:raise ValueError('الوقت خلص؛ ابدئي جولة جديدة')
+            item=d.get('item')
+            if item not in ['👗','👜','💄','🧴','🎧','📱','🪑','🧸']:raise ValueError('منتج غير معروف')
+            if item!=orders[rr['served']]:
+                misses=rr['misses']+1
+                # Wrong answers do not award coins and never shorten the timer.
+                c.execute('UPDATE rush_rounds SET misses=? WHERE user_id=?',(misses,u))
+            else:
+                served=rr['served']+1
+                c.execute('UPDATE rush_rounds SET served=? WHERE user_id=?',(served,u))
+                if served==len(orders):
+                    remaining=max(0,rr['deadline']-int(time.time()))
+                    reward=max(30,stage_reward(rr['stage'],remaining,rr['misses']))
+                    gained_xp=25+rr['stage']*8
+                    xp=p['xp']+gained_xp;level=min(50,1+xp//80)
+                    c.execute('UPDATE players SET coins=coins+?,xp=?,level=? WHERE id=?',(reward,xp,level,u))
+                    c.execute('UPDATE rush_rounds SET reward_claimed=1 WHERE user_id=?',(u,))
+                    # Material drop is fixed and non-cash; continue legacy crafting loop.
+                    occupied={r['slot'] for r in c.execute('SELECT slot FROM tiles WHERE user_id=?',(u,))}
+                    unlocked={r['category'] for r in c.execute('SELECT category FROM shops WHERE user_id=?',(u,))}
+                    cat='fashion' if rr['stage']%2 else ('beauty' if 'beauty' in unlocked else 'fashion')
+                    for slot in [i for i in range(25) if i not in occupied][:2]:
+                        c.execute('INSERT INTO tiles(user_id,category,tier,slot) VALUES(?,?,?,?)',(u,cat,2 if rr['stage']>=3 else 1,slot))
+                    add_ledger(c,u,'rush',reward,'خدمة زبائن المول - المرحلة '+str(rr['stage']))
+        elif cmd=='generate':
             if c.execute('SELECT count(*) n FROM tiles WHERE user_id=?',(u,)).fetchone()['n']>=25:raise ValueError('اللوحة ممتلئة؛ ادمجي قطعًا أولًا')
             cat=d.get('category','fashion')
             if cat not in CATS or not c.execute('SELECT 1 FROM shops WHERE user_id=? AND category=?',(u,cat)).fetchone():raise ValueError('المحل ده لسه مقفول')
             occupied={r['slot'] for r in c.execute('SELECT slot FROM tiles WHERE user_id=?',(u,))}
             slot=next(i for i in range(25) if i not in occupied)
             c.execute('INSERT INTO tiles(user_id,category,tier,slot) VALUES(?,?,1,?)',(u,cat,slot))
-            c.execute('UPDATE players SET energy=energy-1 WHERE id=?',(u,))
+            # Unlimited optional crafting materials: no energy wait in V2.
         elif cmd=='merge':
             a,b=d.get('first'),d.get('second')
             if not isinstance(a,int) or not isinstance(b,int) or a==b:raise ValueError('اختاري قطعتين مختلفتين')
@@ -133,7 +187,7 @@ def action():
             add_ledger(c,u,'unlock',-info['cost'],'فتح '+info['name'])
         elif cmd=='energy':
             now=int(time.time())
-            if now-p['last_energy']<60:raise ValueError('الطاقة المجانية تتجدد بعد دقيقة في النسخة التجريبية')
+            # Legacy button supported without cooldown.
             c.execute('UPDATE players SET energy=min(25,energy+5),last_energy=? WHERE id=?',(now,u))
         elif cmd=='list':
             aid=d.get('asset_id');price=d.get('price')
